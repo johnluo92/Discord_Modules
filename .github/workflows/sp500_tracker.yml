@@ -1,0 +1,55 @@
+name: S&P 500 Reconstitution Tracker
+
+on:
+  schedule:
+    - cron: '0 23 * * 5'   # Fridays 6 pm ET (23:00 UTC)
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Run mode'
+        required: false
+        default: 'normal'
+        type: choice
+        options:
+          - normal
+          - test
+          - heartbeat
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to commit state file back
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tracker
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          MODE="${{ github.event.inputs.mode || 'normal' }}"
+          if [ "$MODE" = "test" ]; then
+            python3 sp500_tracker.py --test
+          elif [ "$MODE" = "heartbeat" ]; then
+            python3 sp500_tracker.py --heartbeat
+          else
+            python3 sp500_tracker.py
+          fi
+
+      - name: Commit updated state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add sp500_state.json
+          git diff --cached --quiet || git commit -m "chore: update sp500 state [skip ci]"
+          git push

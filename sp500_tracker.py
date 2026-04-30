@@ -14,13 +14,14 @@ from datetime import datetime, timezone
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 load_dotenv()
 
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 STATE_FILE = os.path.join(os.path.dirname(__file__), "sp500_state.json")
 WIKIPEDIA_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-HEARTBEAT_EVERY_N_RUNS = 4  # Post "no changes" digest every 4 runs (~monthly at weekly cadence)
 MAX_CHANGES_TO_DISPLAY = 20  # guard against scraping huge history on first run
 
 
@@ -30,7 +31,7 @@ def load_state() -> dict:
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f:
             return json.load(f)
-    return {"seen_keys": [], "run_count": 0, "last_run": None}
+    return {"seen_keys": [], "run_count": 0, "last_run": None, "last_heartbeat_month": None}
 
 
 def save_state(state: dict):
@@ -39,6 +40,17 @@ def save_state(state: dict):
 
 
 # ─── Scraping ─────────────────────────────────────────────────────────────────
+
+def _make_session() -> requests.Session:
+    session = requests.Session()
+    retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    return session
+
+
+def _cell(cols: list, i: int) -> str:
+    return cols[i].get_text(separator=" ", strip=True) if i < len(cols) else ""
+
 
 def fetch_changes() -> list[dict]:
     """
@@ -53,7 +65,8 @@ def fetch_changes() -> list[dict]:
         )
     }
 
-    resp = requests.get(WIKIPEDIA_URL, headers=headers, timeout=20)
+    session = _make_session()
+    resp = session.get(WIKIPEDIA_URL, headers=headers, timeout=20)
     resp.raise_for_status()
 
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -75,15 +88,12 @@ def fetch_changes() -> list[dict]:
         if len(cols) < 4:
             continue
 
-        def cell(i: int) -> str:
-            return cols[i].get_text(separator=" ", strip=True) if i < len(cols) else ""
-
-        date_str      = cell(0)
-        added_ticker  = cell(1).split("[")[0].strip()   # strip footnote refs like [1]
-        added_name    = cell(2).split("[")[0].strip()
-        removed_ticker = cell(3).split("[")[0].strip()
-        removed_name  = cell(4).split("[")[0].strip()
-        reason        = cell(5).split("[")[0].strip()
+        date_str       = _cell(cols, 0)
+        added_ticker   = _cell(cols, 1).split("[")[0].strip()   # strip footnote refs like [1]
+        added_name     = _cell(cols, 2).split("[")[0].strip()
+        removed_ticker = _cell(cols, 3).split("[")[0].strip()
+        removed_name   = _cell(cols, 4).split("[")[0].strip()
+        reason         = _cell(cols, 5).split("[")[0].strip()
 
         # Skip rows that are clearly empty or sub-headers
         if not date_str or date_str.lower() == "date":
@@ -248,6 +258,17 @@ def post_error(error_msg: str):
     _post_embed([embed])
 
 
+# ─── Heartbeat ────────────────────────────────────────────────────────────────
+
+def _send_heartbeat_if_due(state: dict):
+    """Post a status heartbeat at most once per calendar month."""
+    current_month = datetime.now(timezone.utc).strftime("%Y-%m")
+    if state.get("last_heartbeat_month") == current_month:
+        return
+    post_heartbeat(state["run_count"], state.get("last_change_date"))
+    state["last_heartbeat_month"] = current_month
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -316,26 +337,22 @@ def main():
         return
 
     is_first_run = not state.get("seen_keys")
-    new_changes = [
-        c for c in all_changes
-        if c["key"] not in seen_keys
-    ][:MAX_CHANGES_TO_DISPLAY]
+    all_new = [c for c in all_changes if c["key"] not in seen_keys]
+    new_changes = all_new[:MAX_CHANGES_TO_DISPLAY]
 
     if new_changes:
-        seen_keys.update(c["key"] for c in new_changes)
+        seen_keys.update(c["key"] for c in all_new)  # mark all as seen, not just displayed
         state["last_change_date"] = new_changes[0]["date"]
         if is_first_run:
             # Silently seed state on first run — don't flood channel with history
-            print(f"[INFO] First run: seeding state with {len(new_changes)} historical change(s), no Discord post.")
-            post_heartbeat(state["run_count"], state.get("last_change_date"))
+            print(f"[INFO] First run: seeding state with {len(all_new)} historical change(s), no Discord post.")
+            _send_heartbeat_if_due(state)
         else:
             print(f"[INFO] {len(new_changes)} new change(s) detected.")
             post_changes(new_changes)
     else:
         print("[INFO] No new changes.")
-        # Post heartbeat on every Nth run when no changes
-        if state["run_count"] % HEARTBEAT_EVERY_N_RUNS == 0:
-            post_heartbeat(state["run_count"], state.get("last_change_date"))
+        _send_heartbeat_if_due(state)
 
     state["seen_keys"] = list(seen_keys)
     save_state(state)

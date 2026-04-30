@@ -6,81 +6,45 @@ Run weekly via cron: 0 18 * * 5 /usr/bin/python3 /path/to/sp500_tracker.py
 """
 
 import argparse
-import json
 import os
 import sys
 from datetime import datetime, timezone
 
-import requests
 from bs4 import BeautifulSoup
-from dotenv import load_dotenv
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
-load_dotenv()
+from sp500_common import USER_AGENT, get_session, load_state, post_embeds, post_error, save_state
 
-DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 STATE_FILE = os.path.join(os.path.dirname(__file__), "sp500_state.json")
 WIKIPEDIA_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
 MAX_CHANGES_TO_DISPLAY = 20  # guard against scraping huge history on first run
 
+_STATE_DEFAULT = {"seen_keys": [], "run_count": 0, "last_run": None, "last_heartbeat_month": None}
 
-# ─── State ────────────────────────────────────────────────────────────────────
-
-def load_state() -> dict:
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE) as f:
-            return json.load(f)
-    return {"seen_keys": [], "run_count": 0, "last_run": None, "last_heartbeat_month": None}
-
-
-def save_state(state: dict):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+COLOR_ALERT     = 0xE8C547   # gold — new changes
+COLOR_HEARTBEAT = 0x2B2D31   # dark — no changes / status
 
 
 # ─── Scraping ─────────────────────────────────────────────────────────────────
-
-def _make_session() -> requests.Session:
-    session = requests.Session()
-    retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
-    session.mount("https://", HTTPAdapter(max_retries=retry))
-    return session
-
 
 def _cell(cols: list, i: int) -> str:
     return cols[i].get_text(separator=" ", strip=True) if i < len(cols) else ""
 
 
-def fetch_changes() -> list[dict]:
-    """
-    Scrapes the S&P 500 Wikipedia changes table.
-    Returns list of change dicts: {date, added_ticker, added_name, removed_ticker, removed_name, reason, key}
-    """
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        )
-    }
+def _strip_footnotes(text: str) -> str:
+    return text.split("[")[0].strip()
 
-    session = _make_session()
-    resp = session.get(WIKIPEDIA_URL, headers=headers, timeout=20)
+
+def fetch_changes() -> list[dict]:
+    resp = get_session().get(WIKIPEDIA_URL, headers={"User-Agent": USER_AGENT}, timeout=20)
     resp.raise_for_status()
 
     soup = BeautifulSoup(resp.text, "html.parser")
-
-    # The changes table is the second wikitable on the page
     tables = soup.find_all("table", {"class": "wikitable"})
     if len(tables) < 2:
         raise RuntimeError("Could not locate the changes table on Wikipedia.")
 
-    changes_table = tables[1]
-    rows = changes_table.find_all("tr")
-
-    # Skip the two header rows (merged header + sub-header)
-    data_rows = rows[2:]
+    rows = tables[1].find_all("tr")
+    data_rows = rows[2:]  # skip merged header + sub-header rows
 
     changes = []
     for row in data_rows:
@@ -89,18 +53,16 @@ def fetch_changes() -> list[dict]:
             continue
 
         date_str       = _cell(cols, 0)
-        added_ticker   = _cell(cols, 1).split("[")[0].strip()   # strip footnote refs like [1]
-        added_name     = _cell(cols, 2).split("[")[0].strip()
-        removed_ticker = _cell(cols, 3).split("[")[0].strip()
-        removed_name   = _cell(cols, 4).split("[")[0].strip()
-        reason         = _cell(cols, 5).split("[")[0].strip()
+        added_ticker   = _strip_footnotes(_cell(cols, 1))
+        added_name     = _strip_footnotes(_cell(cols, 2))
+        removed_ticker = _strip_footnotes(_cell(cols, 3))
+        removed_name   = _strip_footnotes(_cell(cols, 4))
+        reason         = _strip_footnotes(_cell(cols, 5))
 
-        # Skip rows that are clearly empty or sub-headers
         if not date_str or date_str.lower() == "date":
             continue
 
         key = f"{date_str}|{added_ticker}|{removed_ticker}"
-
         changes.append({
             "date":            date_str,
             "added_ticker":    added_ticker,
@@ -116,36 +78,12 @@ def fetch_changes() -> list[dict]:
 
 # ─── Discord ──────────────────────────────────────────────────────────────────
 
-COLOR_ALERT    = 0xE8C547   # gold  — new changes
-COLOR_HEARTBEAT = 0x2B2D31  # dark  — no changes / status
-COLOR_ERROR    = 0xD9534F   # red   — errors
-
-def _post_embed(embeds: list[dict]):
-    if not DISCORD_WEBHOOK_URL:
-        print("[WARN] DISCORD_WEBHOOK_URL not set — printing embed instead.")
-        print(json.dumps(embeds, indent=2))
-        return
-
-    # Discord allows max 10 embeds per request
-    for i in range(0, len(embeds), 10):
-        resp = requests.post(
-            DISCORD_WEBHOOK_URL,
-            json={"embeds": embeds[i:i + 10]},
-            timeout=15
-        )
-        resp.raise_for_status()
-
-
 def post_changes(new_changes: list[dict]):
-    """
-    Groups changes by date and posts one embed per date bucket.
-    """
     by_date: dict[str, list[dict]] = {}
     for c in new_changes:
         by_date.setdefault(c["date"], []).append(c)
 
     embeds = []
-
     for change_date, changes in by_date.items():
         additions = [
             (c["added_ticker"], c["added_name"])
@@ -162,22 +100,16 @@ def post_changes(new_changes: list[dict]):
         fields = []
 
         if additions:
-            body = "\n".join(
-                f"`{ticker:<6}` **{name}**" for ticker, name in additions
-            )
             fields.append({
                 "name":   "✅  Joining the Index",
-                "value":  body or "—",
+                "value":  "\n".join(f"`{t:<6}` **{n}**" for t, n in additions),
                 "inline": False,
             })
 
         if removals:
-            body = "\n".join(
-                f"`{ticker:<6}` ~~{name}~~" for ticker, name in removals
-            )
             fields.append({
                 "name":   "❌  Leaving the Index",
-                "value":  body or "—",
+                "value":  "\n".join(f"`{t:<6}` ~~{n}~~" for t, n in removals),
                 "inline": False,
             })
 
@@ -188,16 +120,10 @@ def post_changes(new_changes: list[dict]):
                 "inline": False,
             })
 
-        fields.append({
-            "name":   "📅  Effective Date",
-            "value":  change_date,
-            "inline": True,
-        })
-        fields.append({
-            "name":   "🔢  Changes",
-            "value":  f"{len(additions)} in · {len(removals)} out",
-            "inline": True,
-        })
+        fields += [
+            {"name": "📅  Effective Date", "value": change_date,                              "inline": True},
+            {"name": "🔢  Changes",        "value": f"{len(additions)} in · {len(removals)} out", "inline": True},
+        ]
 
         embeds.append({
             "title":       "📊  S&P 500 — Index Reconstitution Alert",
@@ -205,16 +131,14 @@ def post_changes(new_changes: list[dict]):
                 "The S&P Index Committee has confirmed the following constituent changes.\n"
                 "Passive funds will execute corresponding trades at the effective date."
             ),
-            "color":       COLOR_ALERT,
-            "fields":      fields,
-            "footer":      {
-                "text": "Source: S&P Global via Wikipedia  •  Byzantium Technologies"
-            },
-            "timestamp":   datetime.now(timezone.utc).isoformat(),
+            "color":  COLOR_ALERT,
+            "fields": fields,
+            "footer": {"text": "Source: S&P Global via Wikipedia  •  Byzantium Technologies"},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         })
 
     if embeds:
-        _post_embed(embeds)
+        post_embeds(embeds)
         print(f"[OK] Posted {len(embeds)} embed(s) covering {len(new_changes)} change(s).")
 
 
@@ -224,38 +148,15 @@ def post_heartbeat(run_count: int, last_change_date: str | None):
         "description": "Routine scan complete. No new reconstitution events detected this cycle.",
         "color":       COLOR_HEARTBEAT,
         "fields":      [
-            {
-                "name":   "Last Known Change",
-                "value":  last_change_date or "None on record",
-                "inline": True,
-            },
-            {
-                "name":   "Total Runs",
-                "value":  str(run_count),
-                "inline": True,
-            },
-            {
-                "name":   "Next Scheduled Scan",
-                "value":  "Friday ~18:00 ET",
-                "inline": True,
-            },
+            {"name": "Last Known Change",    "value": last_change_date or "None on record", "inline": True},
+            {"name": "Total Runs",           "value": str(run_count),                       "inline": True},
+            {"name": "Next Scheduled Scan",  "value": "Friday ~18:00 ET",                  "inline": True},
         ],
         "footer":    {"text": "Byzantium Technologies  •  S&P 500 Reconstitution Monitor"},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
-    _post_embed([embed])
+    post_embeds([embed])
     print("[OK] Posted heartbeat (no changes).")
-
-
-def post_error(error_msg: str):
-    embed = {
-        "title":       "🔴  S&P 500 Tracker — Scrape Error",
-        "description": f"```{error_msg[:1800]}```",
-        "color":       COLOR_ERROR,
-        "footer":      {"text": "Byzantium Technologies"},
-        "timestamp":   datetime.now(timezone.utc).isoformat(),
-    }
-    _post_embed([embed])
 
 
 # ─── Heartbeat ────────────────────────────────────────────────────────────────
@@ -273,40 +174,27 @@ def _send_heartbeat_if_due(state: dict):
 
 def main():
     parser = argparse.ArgumentParser(description="S&P 500 Reconstitution Tracker")
-    parser.add_argument(
-        "--test",
-        action="store_true",
-        help="Force-post the most recent change regardless of seen state (for testing)."
-    )
-    parser.add_argument(
-        "--heartbeat",
-        action="store_true",
-        help="Force-post a heartbeat status message."
-    )
-    parser.add_argument(
-        "--reset",
-        action="store_true",
-        help="Wipe local state (will re-post all recent changes on next run — use with care)."
-    )
+    parser.add_argument("--test",      action="store_true", help="Force-post the most recent change.")
+    parser.add_argument("--heartbeat", action="store_true", help="Force-post a heartbeat status message.")
+    parser.add_argument("--reset",     action="store_true", help="Wipe local state (use with care).")
     args = parser.parse_args()
 
     if args.reset:
-        if os.path.exists(STATE_FILE):
+        try:
             os.remove(STATE_FILE)
             print("[OK] State reset.")
-        else:
+        except FileNotFoundError:
             print("[OK] No state file found.")
         return
 
-    state = load_state()
+    state = load_state(STATE_FILE, _STATE_DEFAULT)
     state["run_count"] = state.get("run_count", 0) + 1
     state["last_run"] = datetime.now(timezone.utc).isoformat()
     seen_keys = set(state.get("seen_keys", []))
 
     if args.heartbeat:
-        last = state.get("last_change_date")
-        post_heartbeat(state["run_count"], last)
-        save_state(state)
+        post_heartbeat(state["run_count"], state.get("last_change_date"))
+        save_state(STATE_FILE, state)
         return
 
     print(f"[INFO] Run #{state['run_count']} — fetching changes from Wikipedia...")
@@ -317,45 +205,43 @@ def main():
         msg = f"Failed to fetch/parse Wikipedia: {exc}"
         print(f"[ERROR] {msg}", file=sys.stderr)
         try:
-            post_error(msg)
+            post_error("S&P 500 Tracker", msg)
         except Exception:
             pass
-        save_state(state)
+        save_state(STATE_FILE, state)
         sys.exit(1)
 
     print(f"[INFO] Found {len(all_changes)} total historical rows.")
 
     if args.test:
-        # In test mode: force-post the most recent entry
         if all_changes:
-            test_change = all_changes[0]
-            print(f"[TEST] Forcing post of: {test_change['key']}")
-            post_changes([test_change])
+            print(f"[TEST] Forcing post of: {all_changes[0]['key']}")
+            post_changes([all_changes[0]])
         else:
             print("[TEST] No changes found to test with.")
-        save_state(state)
+        save_state(STATE_FILE, state)
         return
 
-    is_first_run = not state.get("seen_keys")
+    is_first_run = not seen_keys
     all_new = [c for c in all_changes if c["key"] not in seen_keys]
     new_changes = all_new[:MAX_CHANGES_TO_DISPLAY]
 
-    if new_changes:
+    if is_first_run and new_changes:
+        seen_keys.update(c["key"] for c in all_new)
+        state["last_change_date"] = new_changes[0]["date"]
+        print(f"[INFO] First run: seeding state with {len(all_new)} historical change(s), no Discord post.")
+        _send_heartbeat_if_due(state)
+    elif new_changes:
         seen_keys.update(c["key"] for c in all_new)  # mark all as seen, not just displayed
         state["last_change_date"] = new_changes[0]["date"]
-        if is_first_run:
-            # Silently seed state on first run — don't flood channel with history
-            print(f"[INFO] First run: seeding state with {len(all_new)} historical change(s), no Discord post.")
-            _send_heartbeat_if_due(state)
-        else:
-            print(f"[INFO] {len(new_changes)} new change(s) detected.")
-            post_changes(new_changes)
+        print(f"[INFO] {len(new_changes)} new change(s) detected.")
+        post_changes(new_changes)
     else:
         print("[INFO] No new changes.")
         _send_heartbeat_if_due(state)
 
     state["seen_keys"] = list(seen_keys)
-    save_state(state)
+    save_state(STATE_FILE, state)
     print("[DONE]")
 
 

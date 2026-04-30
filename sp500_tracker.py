@@ -116,12 +116,14 @@ def _post_embed(embeds: list[dict]):
         print(json.dumps(embeds, indent=2))
         return
 
-    resp = requests.post(
-        DISCORD_WEBHOOK_URL,
-        json={"embeds": embeds},
-        timeout=15
-    )
-    resp.raise_for_status()
+    # Discord allows max 10 embeds per request
+    for i in range(0, len(embeds), 10):
+        resp = requests.post(
+            DISCORD_WEBHOOK_URL,
+            json={"embeds": embeds[i:i + 10]},
+            timeout=15
+        )
+        resp.raise_for_status()
 
 
 def post_changes(new_changes: list[dict]):
@@ -313,17 +315,22 @@ def main():
         save_state(state)
         return
 
+    is_first_run = not state.get("seen_keys")
     new_changes = [
         c for c in all_changes
         if c["key"] not in seen_keys
     ][:MAX_CHANGES_TO_DISPLAY]
 
     if new_changes:
-        print(f"[INFO] {len(new_changes)} new change(s) detected.")
-        post_changes(new_changes)
         seen_keys.update(c["key"] for c in new_changes)
-        # Track most recent change date for heartbeat display
         state["last_change_date"] = new_changes[0]["date"]
+        if is_first_run:
+            # Silently seed state on first run — don't flood channel with history
+            print(f"[INFO] First run: seeding state with {len(new_changes)} historical change(s), no Discord post.")
+            post_heartbeat(state["run_count"], state.get("last_change_date"))
+        else:
+            print(f"[INFO] {len(new_changes)} new change(s) detected.")
+            post_changes(new_changes)
     else:
         print("[INFO] No new changes.")
         # Post heartbeat on every Nth run when no changes

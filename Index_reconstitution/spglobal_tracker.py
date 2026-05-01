@@ -1,56 +1,54 @@
 #!/usr/bin/env python3
 """
 S&P Global Press Room monitor.
-Checks daily (Mon–Fri) for new S&P 500 constituent change announcements.
-Posts to Discord only when a new announcement is found — silent on quiet days.
+Polls the press room RSS feed every 30 min (Mon–Fri, market hours) for new
+S&P 500 / MidCap 400 / SmallCap 600 constituent change announcements.
+Posts to Discord only when a new announcement is found — silent on quiet runs.
 """
 
 import argparse
 import os
 import sys
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
-
-from bs4 import BeautifulSoup
+from email.utils import parsedate_to_datetime
 
 from sp500_common import USER_AGENT, get_session, load_state, post_embeds, post_error, save_state
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), "spglobal_state.json")
-PRESS_ROOM_URL = "https://press.spglobal.com/index.php?s=2429&l=25"
+RSS_URL = "https://press.spglobal.com/index.php?s=2429&l=25&pagetemplate=rss"
 
 _STATE_DEFAULT = {"seen_urls": [], "last_run": None}
 
-COLOR_ALERT = 0x4A90D9   # blue — official announcement
+COLOR_ALERT = 0x4A90D9
+
+_INDEX_KEYWORDS = ("S&P 500", "S&P MidCap 400", "S&P SmallCap 600")
 
 
-# ─── Scraping ─────────────────────────────────────────────────────────────────
+# ─── RSS ──────────────────────────────────────────────────────────────────────
 
 def fetch_announcements() -> list[dict]:
-    resp = get_session().get(PRESS_ROOM_URL, headers={"User-Agent": USER_AGENT}, timeout=20)
+    resp = get_session().get(RSS_URL, headers={"User-Agent": USER_AGENT}, timeout=20)
     resp.raise_for_status()
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    items = soup.find_all("li", class_="wd_item")
-
-    if not items:
-        raise RuntimeError("No press release items found — page structure may have changed.")
+    root = ET.fromstring(resp.content)
+    channel = root.find("channel")
+    if channel is None:
+        raise RuntimeError("RSS feed missing <channel> — feed structure may have changed.")
 
     announcements = []
-    for item in items:
-        date_tag  = item.find("div", class_="wd_date")
-        title_tag = item.find("div", class_="wd_title")
-        if not date_tag or not title_tag:
+    for item in channel.findall("item"):
+        title = (item.findtext("title") or "").strip()
+        url   = (item.findtext("link") or "").strip()
+        pub   = (item.findtext("pubDate") or "").strip()
+
+        if not any(kw in title for kw in _INDEX_KEYWORDS):
             continue
 
-        link = title_tag.find("a")
-        if not link:
-            continue
-
-        title    = link.get_text(strip=True)
-        url      = link.get("href", "")
-        date_str = date_tag.get_text(strip=True)
-
-        if "S&P 500" not in title:
-            continue
+        try:
+            date_str = parsedate_to_datetime(pub).strftime("%B %d, %Y")
+        except Exception:
+            date_str = pub
 
         announcements.append({"date": date_str, "title": title, "url": url})
 
@@ -61,13 +59,13 @@ def fetch_announcements() -> list[dict]:
 
 def post_announcement(announcement: dict):
     embed = {
-        "title":       "📢  S&P 500 — Official Announcement",
+        "title":       "📢  S&P Index Change — Official Announcement",
         "description": f"**{announcement['title']}**",
         "url":         announcement["url"],
         "color":       COLOR_ALERT,
         "fields": [
-            {"name": "📅  Announced",        "value": announcement["date"],                              "inline": True},
-            {"name": "🔗  Full Press Release","value": f"[Read on S&P Global]({announcement['url']})",  "inline": True},
+            {"name": "📅  Announced",         "value": announcement["date"],                             "inline": True},
+            {"name": "🔗  Full Press Release", "value": f"[Read on S&P Global]({announcement['url']})", "inline": True},
         ],
         "footer":    {"text": "Source: S&P Global Press Room  •  Byzantium Technologies"},
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -88,12 +86,12 @@ def main():
     state["last_run"] = datetime.now(timezone.utc).isoformat()
     seen_urls = set(state.get("seen_urls", []))
 
-    print("[INFO] Fetching S&P Global press room...")
+    print("[INFO] Fetching S&P Global press room RSS...")
 
     try:
         announcements = fetch_announcements()
     except Exception as exc:
-        msg = f"Failed to fetch/parse S&P Global press room: {exc}"
+        msg = f"Failed to fetch/parse S&P Global RSS feed: {exc}"
         print(f"[ERROR] {msg}", file=sys.stderr)
         try:
             post_error("S&P Global Monitor", msg)
@@ -102,7 +100,7 @@ def main():
         save_state(STATE_FILE, state)
         sys.exit(1)
 
-    print(f"[INFO] Found {len(announcements)} S&P 500 announcement(s) on page.")
+    print(f"[INFO] Found {len(announcements)} S&P index announcement(s) in feed.")
 
     if args.test:
         if announcements:
@@ -125,7 +123,7 @@ def main():
             post_announcement(announcement)
         print(f"[INFO] Posted {len(new_announcements)} new announcement(s).")
     else:
-        print("[INFO] No new S&P 500 announcements.")
+        print("[INFO] No new S&P index announcements.")
 
     state["seen_urls"] = list(seen_urls)
     save_state(STATE_FILE, state)

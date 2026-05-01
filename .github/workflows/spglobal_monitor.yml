@@ -2,7 +2,7 @@ name: S&P Global Press Room Monitor
 
 on:
   schedule:
-    - cron: '0 21 * * 1-5'   # Monday–Friday 5 PM ET (21:00 UTC)
+    - cron: '*/30 13-22 * * 1-5'   # Monday–Friday every 30 min, 9 AM–6 PM ET (13:00–22:00 UTC)
   workflow_dispatch:
     inputs:
       mode:

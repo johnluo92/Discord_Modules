@@ -3,3 +3,5 @@
 __pycache__/
 *.pyc
 .claude/
+# Discord summary lives locally only — input contains private conversation data; project unfinished
+Discord summary/
